@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 
 import torch
@@ -181,7 +182,131 @@ def _generation_controls() -> dict:
                 "min": 0.0,
                 "max": 2.0,
                 "step": 0.05,
-                "tooltip": "Seconds of silence inserted between longform chunks. Does not replace inline pause tags.",
+                "tooltip": (
+                    "Seconds of silence inserted between longform chunks. Does not replace inline pause "
+                    "tags. With chunk_combination_method=crossfade specifically: 0 means the chunks "
+                    "actually overlap by crossfade_duration (a true crossfade); any value above 0 means "
+                    "a real silence gap of this length is inserted instead, with each edge only faded "
+                    "(by crossfade_duration) rather than overlapped - see crossfade_duration's tooltip."
+                ),
+            },
+        ),
+        "chunk_combination_method": (
+            CHUNK_COMBINATION_METHODS,
+            {
+                "default": "auto",
+                "tooltip": (
+                    "How generated chunks/speaker turns are joined. auto: silence_padding when "
+                    "pause_between_chunks/pause_between_speakers > 0, otherwise concatenate (old "
+                    "behavior). concatenate: hard join, no gap. silence_padding: insert plain silence "
+                    "between pieces (can leave a click/peak right at the codec's chunk-seam, since "
+                    "Higgs' audio codec carries decode state across time). crossfade: at pause=0, "
+                    "overlaps the seam by crossfade_duration (true crossfade); at pause>0, inserts that "
+                    "much real silence and only fades each edge into/out of it by crossfade_duration "
+                    "(no overlap) - see crossfade_duration's tooltip for why. Idea and option names from "
+                    "TTS Audio Suite's chunk_combination_method (https://github.com/diodiogod/TTS-Audio-Suite)."
+                ),
+            },
+        ),
+        "crossfade_duration": (
+            "FLOAT",
+            {
+                "default": 0.08,
+                "min": 0.01,
+                "max": 0.5,
+                "step": 0.01,
+                "tooltip": (
+                    "Only used when chunk_combination_method=crossfade. Its meaning depends on "
+                    "pause_between_chunks/pause_between_speakers: at pause=0, this is the overlap window "
+                    "for a true crossfade (the two independently generated, out-of-phase takes actually "
+                    "play back on top of each other for this long - keep it short, ~0.03-0.15s, or it "
+                    "starts sounding like the words are smearing/sliding into each other). At pause>0, "
+                    "there is NO overlap: pause_between_chunks/pause_between_speakers becomes a real "
+                    "silence gap, and this value is just the fade-out/fade-in length on each side going "
+                    "into/out of that silence - safe to raise a bit higher here since nothing is playing "
+                    "on top of anything else."
+                ),
+            },
+        ),
+        "declick_chunk_edges": (
+            "BOOLEAN",
+            {
+                "default": True,
+                "tooltip": (
+                    "Fade the start/end of each internal chunk (or speaker turn) by declick_ms before "
+                    "joining, to remove the short click/pop Higgs' codec can leave at a chunk's "
+                    "generation edge. Works with every chunk_combination_method, including "
+                    "silence_padding - unlike crossfade, it removes the transient at its source instead "
+                    "of blending it away."
+                ),
+            },
+        ),
+        "declick_ms": (
+            "FLOAT",
+            {
+                "default": 12.0,
+                "min": 1.0,
+                "max": 50.0,
+                "step": 1.0,
+                "tooltip": "Fade length in milliseconds applied at each internal chunk boundary when declick_chunk_edges is on.",
+            },
+        ),
+        "trim_chunk_tails": (
+            "BOOLEAN",
+            {
+                "default": True,
+                "tooltip": (
+                    "Cut off a quiet trailing buzz/hum some codec generations leave right before true "
+                    "silence, at the END of each internal chunk/speaker turn, before joining. This is a "
+                    "different artifact than a splice click - it's part of the generated audio itself, "
+                    "sitting further back than declick_ms's short seam-fade reaches, so it needs this "
+                    "separate energy-based trim to remove."
+                ),
+            },
+        ),
+        "trim_tail_threshold_db": (
+            "FLOAT",
+            {
+                "default": -35.0,
+                "min": -80.0,
+                "max": -10.0,
+                "step": 1.0,
+                "tooltip": (
+                    "RMS level (dBFS) below which the tail of a chunk is considered 'not real speech' and "
+                    "trimmed when trim_chunk_tails is on. Lower (more negative) = more conservative, only "
+                    "trims very quiet tails; higher (less negative) = trims more aggressively but risks "
+                    "clipping a genuinely soft word ending."
+                ),
+            },
+        ),
+        "head_handle": (
+            "FLOAT",
+            {
+                "default": 0.0,
+                "min": 0.0,
+                "max": 10.0,
+                "step": 0.1,
+                "tooltip": (
+                    "Seconds of silence to pad onto the START of the final output audio (same handle "
+                    "concept as MOSS-TTS's head_handle). Useful with chunk_combination_method=crossfade: "
+                    "overshoot by ~1s so any codec click at the very start of the take lands in this "
+                    "padding instead of in the spoken audio, making it easy to trim off in an editor."
+                ),
+            },
+        ),
+        "tail_handle": (
+            "FLOAT",
+            {
+                "default": 0.0,
+                "min": 0.0,
+                "max": 10.0,
+                "step": 0.1,
+                "tooltip": (
+                    "Seconds of silence to pad onto the END of the final output audio (same handle "
+                    "concept as MOSS-TTS's tail_handle). Useful with chunk_combination_method=crossfade: "
+                    "overshoot by ~1s so any codec click at the very end of the take lands in this "
+                    "padding instead of in the spoken audio, making it easy to trim off in an editor."
+                ),
             },
         ),
     }
@@ -405,25 +530,290 @@ def _tag_chunk_text(text: str, words_per_chunk: int) -> list[str]:
     return [chunk for chunk in chunks if chunk.strip()]
 
 
-def _concat_audio_segments(segments: list[dict], pause_seconds: float) -> dict:
+# Chunk-join strategies for _concat_audio_segments(). The idea for this
+# auto/concatenate/silence_padding/crossfade parameter (and its name) comes
+# from the TTS Audio Suite project's `chunk_combination_method` option on its
+# Unified TTS Text node (https://github.com/diodiogod/TTS-Audio-Suite) -
+# credit to diodiogod. It was added here because Higgs v3's audio codec
+# carries decode state across time, so independently generated chunks can
+# click at the seam; crossfading the seam (instead of just padding it with
+# silence) smooths that discontinuity out.
+CHUNK_COMBINATION_METHODS = ["auto", "concatenate", "silence_padding", "crossfade"]
+
+
+def _crossfade_join(prev: torch.Tensor, nxt: torch.Tensor, crossfade_seconds: float, sample_rate: int) -> torch.Tensor:
+    """Overlap-blend the tail of `prev` into the head of `nxt` with an
+    equal-power crossfade, instead of hard-cutting or padding with silence.
+    This is what smooths the codec-boundary click at a chunk seam."""
+    n = int(max(0.0, crossfade_seconds) * sample_rate)
+    n = min(n, prev.shape[-1], nxt.shape[-1])
+    if n <= 0:
+        return torch.cat([prev, nxt], dim=-1)
+
+    ramp = torch.linspace(0.0, 1.0, n, dtype=prev.dtype)
+    fade_out = torch.cos(ramp * (math.pi / 2.0))  # 1 -> 0
+    fade_in = torch.sin(ramp * (math.pi / 2.0))   # 0 -> 1
+
+    prev_head = prev[..., :-n]
+    prev_tail = prev[..., -n:] * fade_out
+    nxt_head = nxt[..., :n] * fade_in
+    nxt_tail = nxt[..., n:]
+
+    blended = prev_tail + nxt_head
+    return torch.cat([prev_head, blended, nxt_tail], dim=-1)
+
+
+def _concat_audio_segments(
+    segments: list[dict],
+    pause_seconds: float,
+    method: str = "auto",
+    crossfade_seconds: float | None = None,
+) -> dict:
+    """Join generated audio segments using the requested combination method.
+
+    method:
+      - "concatenate": hard join, no silence, no crossfade.
+      - "silence_padding": insert `pause_seconds` of digital silence between
+        segments (this was the previous, and only, behavior of this node).
+      - "crossfade": behavior depends on `pause_seconds`:
+          - pause_seconds == 0: the two chunks actually overlap-add over
+            `crossfade_seconds` (a true crossfade, DJ-transition style).
+          - pause_seconds > 0: no overlap - each edge fades down to/up from
+            true silence over `crossfade_seconds`, and that much real
+            silence is inserted between them. Overlapping two independent,
+            out-of-phase voiced takes is what causes an audible "sliding
+            into each other"/comb-filter smear, so any actual pause is
+            handled as a soft-edged silence gap instead of a bigger overlap.
+      - "auto": silence_padding when pause_seconds > 0, otherwise
+        concatenate. Matches the old, single behavior for anyone who leaves
+        this control untouched.
+    """
     if not segments:
         raise RuntimeError("No audio segments were generated.")
+
     sample_rate = int(segments[0]["sample_rate"])
-    parts: list[torch.Tensor] = []
-    pause_samples = int(max(0.0, float(pause_seconds)) * sample_rate)
-    silence = None
-    if pause_samples > 0:
-        silence = torch.zeros((1, 1, pause_samples), dtype=torch.float32)
+    method = (method or "auto").lower()
+    if method not in CHUNK_COMBINATION_METHODS:
+        raise ValueError(
+            f"Unknown chunk_combination_method '{method}'. Expected one of {CHUNK_COMBINATION_METHODS}."
+        )
+
+    waveforms: list[torch.Tensor] = []
     for segment in segments:
         if int(segment["sample_rate"]) != sample_rate:
             raise RuntimeError("Generated chunks have mismatched sample rates.")
-        if parts and silence is not None:
-            parts.append(silence)
         waveform = segment["waveform"]
         if not isinstance(waveform, torch.Tensor):
             waveform = torch.as_tensor(waveform)
-        parts.append(waveform.detach().float().cpu())
-    return {"waveform": torch.cat(parts, dim=-1).contiguous(), "sample_rate": sample_rate}
+        waveforms.append(waveform.detach().float().cpu())
+
+    if len(waveforms) == 1:
+        return {"waveform": waveforms[0].contiguous(), "sample_rate": sample_rate}
+
+    if method == "auto":
+        method = "silence_padding" if pause_seconds > 0 else "concatenate"
+
+    if method == "concatenate":
+        result = torch.cat(waveforms, dim=-1)
+
+    elif method == "silence_padding":
+        pause_samples = int(max(0.0, float(pause_seconds)) * sample_rate)
+        if pause_samples <= 0:
+            result = torch.cat(waveforms, dim=-1)
+        else:
+            silence = torch.zeros((1, 1, pause_samples), dtype=torch.float32)
+            parts: list[torch.Tensor] = []
+            for index, waveform in enumerate(waveforms):
+                if index > 0:
+                    parts.append(silence)
+                parts.append(waveform)
+            result = torch.cat(parts, dim=-1)
+
+    else:  # crossfade
+        fade_seconds = float(crossfade_seconds) if crossfade_seconds is not None and crossfade_seconds > 0 else 0.05
+        gap_samples = int(max(0.0, float(pause_seconds)) * sample_rate)
+
+        if gap_samples <= 0:
+            # No gap: the two chunks actually overlap-add over the crossfade
+            # window (this is "crossfade" in the classic DJ-transition sense).
+            result = waveforms[0]
+            for waveform in waveforms[1:]:
+                result = _crossfade_join(result, waveform, fade_seconds, sample_rate)
+        else:
+            # A real pause is wanted: don't overlap two independent voiced
+            # signals (that's what causes the "sliding into each other" /
+            # comb-filter smear) - instead fade each edge DOWN TO/UP FROM
+            # true silence over the crossfade window, then insert the actual
+            # silence gap between them. pause_seconds=0 is the only case
+            # that produces a true overlap; any positive pause always means
+            # "insert this much silence, with soft (not hard-cut) edges."
+            silence = torch.zeros((1, 1, gap_samples), dtype=torch.float32)
+            parts: list[torch.Tensor] = []
+            for index, waveform in enumerate(waveforms):
+                faded = _declick_edge(
+                    waveform,
+                    sample_rate,
+                    fade_seconds * 1000.0,
+                    fade_start=index > 0,
+                    fade_end=index < len(waveforms) - 1,
+                )
+                if index > 0:
+                    parts.append(silence)
+                parts.append(faded)
+            result = torch.cat(parts, dim=-1)
+
+    return {"waveform": result.contiguous(), "sample_rate": sample_rate}
+
+
+def _apply_handles(tensor: torch.Tensor, sample_rate: int, head_seconds: float, tail_seconds: float) -> torch.Tensor:
+    """Pad silence before/after a Higgs audio tensor.
+
+    Ported from the MOSS-TTS nodepack's apply_handles() helper so Higgs v3
+    gets the same head/tail handle behavior. Useful on its own (extra
+    breathing room at the start/end of a clip), and especially useful when
+    `chunk_combination_method="crossfade"`: generate ~1s of extra head/tail
+    handle, and any codec click that lands at the very start/end of the
+    take (rather than at an internal chunk seam, which crossfade already
+    smooths) ends up inside that padded silence, easy to trim off in an
+    editor instead of sitting inside the spoken audio.
+    """
+    head_samples = int(max(0.0, head_seconds) * sample_rate)
+    tail_samples = int(max(0.0, tail_seconds) * sample_rate)
+    if head_samples <= 0 and tail_samples <= 0:
+        return tensor
+
+    def _silence(n_samples: int) -> torch.Tensor:
+        shape = list(tensor.shape)
+        shape[-1] = n_samples
+        return torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)
+
+    parts = []
+    if head_samples > 0:
+        parts.append(_silence(head_samples))
+    parts.append(tensor)
+    if tail_samples > 0:
+        parts.append(_silence(tail_samples))
+    return torch.cat(parts, dim=-1)
+
+
+def _trim_trailing_noise(waveform: torch.Tensor, sample_rate: int, threshold_db: float, pad_ms: float = 30.0) -> torch.Tensor:
+    """Cut off a quiet trailing tail from the END of a generated chunk before
+    it gets joined to the next one - e.g. the low-level buzz/hum some neural
+    audio codecs leave right before true silence, as the token stream nears
+    its stop token. This is a real generated artifact, not a splice click,
+    so _declick_edge()'s short seam-fade doesn't reach far enough back to
+    remove it.
+
+    Finds the last 10ms analysis frame whose RMS is above `threshold_db`,
+    keeps a `pad_ms` cushion after it, and fades that cushion out to zero so
+    the cut itself doesn't introduce a new click.
+    """
+    total = waveform.shape[-1]
+    frame = max(1, int(sample_rate * 0.01))  # 10ms analysis frames
+    n_frames = total // frame
+    if n_frames < 2:
+        return waveform
+
+    flat = waveform.reshape(-1)
+    usable = flat[: n_frames * frame].reshape(n_frames, frame)
+    rms = usable.pow(2).mean(dim=-1).sqrt()
+    threshold = 10 ** (threshold_db / 20.0)
+    active = torch.nonzero(rms > threshold, as_tuple=False).flatten()
+    if active.numel() == 0:
+        return waveform  # nothing above threshold anywhere; leave as-is
+
+    last_active_frame = int(active[-1].item())
+    pad_samples = int(sample_rate * pad_ms / 1000.0)
+    cut_sample = min(total, (last_active_frame + 1) * frame + pad_samples)
+    if cut_sample >= total:
+        return waveform  # nothing to trim
+
+    trimmed = waveform[..., :cut_sample].clone()
+    fade_n = min(pad_samples, trimmed.shape[-1])
+    if fade_n > 0:
+        ramp = torch.linspace(1.0, 0.0, fade_n, dtype=trimmed.dtype)
+        trimmed[..., -fade_n:] = trimmed[..., -fade_n:] * ramp
+    return trimmed
+
+
+def _trim_segment_tails(segments: list[dict], threshold_db: float) -> list[dict]:
+    """Apply _trim_trailing_noise() to every segment about to be joined."""
+    result = []
+    for segment in segments:
+        waveform = segment["waveform"]
+        if not isinstance(waveform, torch.Tensor):
+            waveform = torch.as_tensor(waveform)
+        trimmed = _trim_trailing_noise(waveform.detach().float().cpu(), int(segment["sample_rate"]), threshold_db)
+        result.append({"waveform": trimmed, "sample_rate": segment["sample_rate"]})
+    return result
+
+
+def _declick_edge(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    fade_ms: float,
+    *,
+    fade_start: bool,
+    fade_end: bool,
+) -> torch.Tensor:
+    """Fade a chunk's own start/end by a few milliseconds to remove the short
+    broadband click/pop Higgs' audio codec can leave at a chunk's generation
+    edge (the codec carries decode state across time, so an independently
+    generated chunk can start/end with a brief discontinuity). This is
+    applied to each internal chunk boundary BEFORE concatenation/crossfade,
+    so it helps regardless of chunk_combination_method - unlike crossfade
+    (which blends two edges together), this removes the transient at its
+    source instead of masking it.
+
+    `fade_start`/`fade_end` are False for the very first/last piece in a
+    sequence, since there is no seam to declick on that side.
+    """
+    if not (fade_start or fade_end):
+        return waveform
+    n = int(max(0.0, fade_ms) / 1000.0 * sample_rate)
+    n = min(n, waveform.shape[-1] // 2)
+    if n <= 0:
+        return waveform
+    waveform = waveform.clone()
+    if fade_start:
+        ramp = torch.linspace(0.0, 1.0, n, dtype=waveform.dtype)
+        waveform[..., :n] = waveform[..., :n] * ramp
+    if fade_end:
+        ramp = torch.linspace(1.0, 0.0, n, dtype=waveform.dtype)
+        waveform[..., -n:] = waveform[..., -n:] * ramp
+    return waveform
+
+
+def _declick_segments(segments: list[dict], fade_ms: float) -> list[dict]:
+    """Apply _declick_edge() to every internal seam in a list of generated
+    segments that are about to be joined (chunks, or speaker turns)."""
+    if len(segments) <= 1:
+        return segments
+    result = []
+    for index, segment in enumerate(segments):
+        waveform = segment["waveform"]
+        if not isinstance(waveform, torch.Tensor):
+            waveform = torch.as_tensor(waveform)
+        faded = _declick_edge(
+            waveform.detach().float().cpu(),
+            int(segment["sample_rate"]),
+            fade_ms,
+            fade_start=index > 0,
+            fade_end=index < len(segments) - 1,
+        )
+        result.append({"waveform": faded, "sample_rate": segment["sample_rate"]})
+    return result
+
+
+def _apply_handles_to_audio(audio: dict, head_seconds: float, tail_seconds: float) -> dict:
+    """_apply_handles(), operating on a ComfyUI AUDIO dict instead of a bare tensor."""
+    if head_seconds <= 0 and tail_seconds <= 0:
+        return audio
+    waveform = audio["waveform"]
+    if not isinstance(waveform, torch.Tensor):
+        waveform = torch.as_tensor(waveform)
+    padded = _apply_handles(waveform.detach().float().cpu(), int(audio["sample_rate"]), float(head_seconds), float(tail_seconds))
+    return {"waveform": padded.contiguous(), "sample_rate": audio["sample_rate"]}
 
 
 def _ensure_bundle_is_loaded(higgs_model):
@@ -451,6 +841,12 @@ def _generate_chunked_audio(
     words_per_chunk: int,
     tag_chunk: bool = False,
     pause_between_chunks: float,
+    chunk_combination_method: str = "auto",
+    crossfade_duration: float | None = None,
+    declick_chunk_edges: bool = True,
+    declick_ms: float = 12.0,
+    trim_chunk_tails: bool = True,
+    trim_tail_threshold_db: float = -35.0,
     progress_callback=None,
     use_first_chunk_as_reference: bool = False,
 ) -> dict:
@@ -558,7 +954,14 @@ def _generate_chunked_audio(
         _update_delivery_state_from_text(delivery_state, chunk)
         if progress_callback is not None:
             progress_callback((index + 1) * PROGRESS_UNITS_PER_SEGMENT, progress_total)
-    return _concat_audio_segments(segments, pause_between_chunks if len(segments) > 1 else 0.0)
+    join_segments = _trim_segment_tails(segments, float(trim_tail_threshold_db)) if bool(trim_chunk_tails) else segments
+    join_segments = _declick_segments(join_segments, float(declick_ms)) if bool(declick_chunk_edges) else join_segments
+    return _concat_audio_segments(
+        join_segments,
+        pause_between_chunks if len(segments) > 1 else 0.0,
+        method=chunk_combination_method,
+        crossfade_seconds=crossfade_duration,
+    )
 
 
 def _parse_dialogue_lines(text: str) -> list[tuple[int, str]]:
@@ -676,6 +1079,14 @@ class HiggsV3Generate:
         words_per_chunk: int,
         tag_chunk: bool,
         pause_between_chunks: float,
+        chunk_combination_method: str,
+        crossfade_duration: float,
+        declick_chunk_edges: bool,
+        declick_ms: float,
+        trim_chunk_tails: bool,
+        trim_tail_threshold_db: float,
+        head_handle: float,
+        tail_handle: float,
     ) -> tuple[dict]:
         pbar = ProgressBar(PROGRESS_UNITS_PER_SEGMENT) if ProgressBar is not None else None
 
@@ -698,9 +1109,16 @@ class HiggsV3Generate:
             words_per_chunk=int(words_per_chunk),
             tag_chunk=bool(tag_chunk),
             pause_between_chunks=float(pause_between_chunks),
+            chunk_combination_method=chunk_combination_method,
+            crossfade_duration=crossfade_duration,
+            declick_chunk_edges=bool(declick_chunk_edges),
+            declick_ms=float(declick_ms),
+            trim_chunk_tails=bool(trim_chunk_tails),
+            trim_tail_threshold_db=float(trim_tail_threshold_db),
             progress_callback=update_progress,
             use_first_chunk_as_reference=True,
         )
+        audio = _apply_handles_to_audio(audio, float(head_handle), float(tail_handle))
         return (audio,)
 
 
@@ -749,6 +1167,14 @@ class HiggsV3VoiceClone:
         words_per_chunk: int,
         tag_chunk: bool,
         pause_between_chunks: float,
+        chunk_combination_method: str,
+        crossfade_duration: float,
+        declick_chunk_edges: bool,
+        declick_ms: float,
+        trim_chunk_tails: bool,
+        trim_tail_threshold_db: float,
+        head_handle: float,
+        tail_handle: float,
     ) -> tuple[dict]:
         pbar = ProgressBar(PROGRESS_UNITS_PER_SEGMENT) if ProgressBar is not None else None
 
@@ -771,8 +1197,15 @@ class HiggsV3VoiceClone:
             words_per_chunk=int(words_per_chunk),
             tag_chunk=bool(tag_chunk),
             pause_between_chunks=float(pause_between_chunks),
+            chunk_combination_method=chunk_combination_method,
+            crossfade_duration=crossfade_duration,
+            declick_chunk_edges=bool(declick_chunk_edges),
+            declick_ms=float(declick_ms),
+            trim_chunk_tails=bool(trim_chunk_tails),
+            trim_tail_threshold_db=float(trim_tail_threshold_db),
             progress_callback=update_progress,
         )
+        audio = _apply_handles_to_audio(audio, float(head_handle), float(tail_handle))
         return (audio,)
 
 
@@ -875,7 +1308,101 @@ def _io_generation_inputs() -> list:
             min=0.0,
             max=2.0,
             step=0.05,
-            tooltip="Seconds of silence inserted between longform chunks. Does not replace inline pause tags.",
+            tooltip=(
+                "Seconds of silence inserted between longform chunks. Does not replace inline pause "
+                "tags. With chunk_combination_method=crossfade: 0 means the chunks overlap by "
+                "crossfade_duration (a true crossfade); above 0 means a real silence gap of this length "
+                "instead, with each edge only faded (not overlapped) - see crossfade_duration's tooltip."
+            ),
+        ),
+        IO.Combo.Input(
+            "chunk_combination_method",
+            options=CHUNK_COMBINATION_METHODS,
+            default="auto",
+            tooltip=(
+                "How generated chunks/speaker turns are joined. auto: silence_padding when the pause "
+                "duration > 0, otherwise concatenate (old behavior). concatenate: hard join, no gap. "
+                "silence_padding: insert plain silence between pieces (can leave a click/peak right at "
+                "the codec's chunk-seam). crossfade: at pause=0, overlaps the seam by crossfade_duration "
+                "(true crossfade); at pause>0, inserts that much real silence and only fades each edge "
+                "into/out of it (no overlap). Idea and option names from TTS Audio Suite's "
+                "chunk_combination_method (https://github.com/diodiogod/TTS-Audio-Suite)."
+            ),
+        ),
+        IO.Float.Input(
+            "crossfade_duration",
+            default=0.08,
+            min=0.01,
+            max=0.5,
+            step=0.01,
+            tooltip=(
+                "Only used when chunk_combination_method=crossfade. Depends on the pause duration: at "
+                "pause=0, this is the true-crossfade overlap window (two independent takes actually play "
+                "on top of each other for this long - keep it short, ~0.03-0.15s, or words start "
+                "smearing/sliding into each other). At pause>0, there is no overlap: pause becomes a real "
+                "silence gap and this is just the fade length on each side into/out of it."
+            ),
+        ),
+        IO.Boolean.Input(
+            "declick_chunk_edges",
+            default=True,
+            tooltip=(
+                "Fade the start/end of each internal chunk (or speaker turn) by declick_ms before "
+                "joining, to remove the short click/pop Higgs' codec can leave at a chunk's generation "
+                "edge. Works with every chunk_combination_method, including silence_padding."
+            ),
+        ),
+        IO.Float.Input(
+            "declick_ms",
+            default=12.0,
+            min=1.0,
+            max=50.0,
+            step=1.0,
+            tooltip="Fade length in milliseconds applied at each internal chunk boundary when declick_chunk_edges is on.",
+        ),
+        IO.Boolean.Input(
+            "trim_chunk_tails",
+            default=True,
+            tooltip=(
+                "Cut off a quiet trailing buzz/hum some codec generations leave right before true "
+                "silence, at the END of each internal chunk/speaker turn, before joining. Different "
+                "artifact than a splice click - sits further back than declick_ms reaches."
+            ),
+        ),
+        IO.Float.Input(
+            "trim_tail_threshold_db",
+            default=-35.0,
+            min=-80.0,
+            max=-10.0,
+            step=1.0,
+            tooltip=(
+                "RMS level (dBFS) below which a chunk's tail counts as 'not real speech' and gets "
+                "trimmed when trim_chunk_tails is on. Lower = more conservative; higher = more aggressive."
+            ),
+        ),
+        IO.Float.Input(
+            "head_handle",
+            default=0.0,
+            min=0.0,
+            max=10.0,
+            step=0.1,
+            tooltip=(
+                "Seconds of silence to pad onto the START of the final output (same handle concept as "
+                "MOSS-TTS's head_handle). With chunk_combination_method=crossfade, overshoot by ~1s so a "
+                "codec click at the very start lands in this padding, not the spoken audio."
+            ),
+        ),
+        IO.Float.Input(
+            "tail_handle",
+            default=0.0,
+            min=0.0,
+            max=10.0,
+            step=0.1,
+            tooltip=(
+                "Seconds of silence to pad onto the END of the final output (same handle concept as "
+                "MOSS-TTS's tail_handle). With chunk_combination_method=crossfade, overshoot by ~1s so a "
+                "codec click at the very end lands in this padding, not the spoken audio."
+            ),
         ),
     ]
 
@@ -897,6 +1424,12 @@ def _generate_multi_speaker_audio(
     words_per_chunk: int,
     tag_chunk: bool = False,
     pause_between_chunks: float,
+    chunk_combination_method: str = "auto",
+    crossfade_duration: float | None = None,
+    declick_chunk_edges: bool = True,
+    declick_ms: float = 12.0,
+    trim_chunk_tails: bool = True,
+    trim_tail_threshold_db: float = -35.0,
 ) -> dict:
     turns = _parse_dialogue_lines(text)
     if not turns:
@@ -947,6 +1480,12 @@ def _generate_multi_speaker_audio(
                 words_per_chunk=int(words_per_chunk),
                 tag_chunk=bool(tag_chunk),
                 pause_between_chunks=float(pause_between_chunks),
+                chunk_combination_method=chunk_combination_method,
+                crossfade_duration=crossfade_duration,
+                declick_chunk_edges=declick_chunk_edges,
+                declick_ms=declick_ms,
+                trim_chunk_tails=trim_chunk_tails,
+                trim_tail_threshold_db=trim_tail_threshold_db,
                 progress_callback=update_turn,
             )
         )
@@ -956,7 +1495,14 @@ def _generate_multi_speaker_audio(
                 len(turns) * PROGRESS_UNITS_PER_SEGMENT,
             )
 
-    return _concat_audio_segments(segments, float(pause_between_speakers))
+    join_segments = _trim_segment_tails(segments, float(trim_tail_threshold_db)) if bool(trim_chunk_tails) else segments
+    join_segments = _declick_segments(join_segments, float(declick_ms)) if bool(declick_chunk_edges) else join_segments
+    return _concat_audio_segments(
+        join_segments,
+        float(pause_between_speakers),
+        method=chunk_combination_method,
+        crossfade_seconds=crossfade_duration,
+    )
 
 
 if _HAS_DYNAMIC_COMBO:
@@ -999,7 +1545,11 @@ if _HAS_DYNAMIC_COMBO:
                         min=0.0,
                         max=3.0,
                         step=0.05,
-                        tooltip="Seconds of silence inserted when moving from one speaker turn to the next.",
+                        tooltip=(
+                            "Seconds of silence inserted when moving from one speaker turn to the next. "
+                            "With chunk_combination_method=crossfade: 0 means turns overlap by "
+                            "crossfade_duration; above 0 means a real silence gap with faded edges instead."
+                        ),
                     ),
                     *_io_generation_inputs(),
                 ],
@@ -1022,6 +1572,14 @@ if _HAS_DYNAMIC_COMBO:
             words_per_chunk: int,
             tag_chunk: bool,
             pause_between_chunks: float,
+            chunk_combination_method: str,
+            crossfade_duration: float,
+            declick_chunk_edges: bool,
+            declick_ms: float,
+            trim_chunk_tails: bool,
+            trim_tail_threshold_db: float,
+            head_handle: float,
+            tail_handle: float,
         ) -> IO.NodeOutput:
             speaker_count = int(num_speakers.get("num_speakers", 2))
             speaker_audio = {
@@ -1048,7 +1606,14 @@ if _HAS_DYNAMIC_COMBO:
                 words_per_chunk=int(words_per_chunk),
                 tag_chunk=bool(tag_chunk),
                 pause_between_chunks=float(pause_between_chunks),
+                chunk_combination_method=chunk_combination_method,
+                crossfade_duration=crossfade_duration,
+                declick_chunk_edges=bool(declick_chunk_edges),
+                declick_ms=float(declick_ms),
+                trim_chunk_tails=bool(trim_chunk_tails),
+                trim_tail_threshold_db=float(trim_tail_threshold_db),
             )
+            audio = _apply_handles_to_audio(audio, float(head_handle), float(tail_handle))
             return IO.NodeOutput(audio)
 
 else:
@@ -1107,7 +1672,11 @@ else:
                         "min": 0.0,
                         "max": 3.0,
                         "step": 0.05,
-                        "tooltip": "Seconds of silence inserted when moving from one generated speaker turn to the next.",
+                        "tooltip": (
+                            "Seconds of silence inserted when moving from one generated speaker turn to "
+                            "the next. With chunk_combination_method=crossfade: 0 means turns overlap by "
+                            "crossfade_duration; above 0 means a real silence gap with faded edges instead."
+                        ),
                     },
                 ),
             }
@@ -1158,6 +1727,14 @@ else:
             words_per_chunk: int,
             tag_chunk: bool,
             pause_between_chunks: float,
+            chunk_combination_method: str,
+            crossfade_duration: float,
+            declick_chunk_edges: bool,
+            declick_ms: float,
+            trim_chunk_tails: bool,
+            trim_tail_threshold_db: float,
+            head_handle: float,
+            tail_handle: float,
             **kwargs,
         ) -> tuple[dict]:
             speaker_audio: dict[int, dict | None] = {
@@ -1189,7 +1766,14 @@ else:
                 words_per_chunk=int(words_per_chunk),
                 tag_chunk=bool(tag_chunk),
                 pause_between_chunks=float(pause_between_chunks),
+                chunk_combination_method=chunk_combination_method,
+                crossfade_duration=crossfade_duration,
+                declick_chunk_edges=bool(declick_chunk_edges),
+                declick_ms=float(declick_ms),
+                trim_chunk_tails=bool(trim_chunk_tails),
+                trim_tail_threshold_db=float(trim_tail_threshold_db),
             )
+            audio = _apply_handles_to_audio(audio, float(head_handle), float(tail_handle))
             return (audio,)
 
 
